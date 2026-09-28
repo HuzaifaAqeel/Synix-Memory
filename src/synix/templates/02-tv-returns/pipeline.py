@@ -1,0 +1,65 @@
+# pipeline.py — TV Returns Demo Pipeline
+#
+# Synix pipelines are defined in Python. Each pipeline declares:
+#   - Layers:      the DAG of transforms (source -> derived -> enriched)
+#   - Projections: how artifacts become searchable (FTS5, embeddings)
+#
+# This pipeline builds customer service product briefs for a TV retailer.
+# Source data: product catalog + vendor offers + store policies.
+# Output: searchable CS reference briefs with validated, conflict-free content.
+#
+# Custom transforms live in transforms.py — imported and used as layers.
+
+from transforms import (
+    DemoEnrichCSBriefTransform,
+    DemoExtractPoliciesTransform,
+    DemoLoadPoliciesTransform,
+    DemoLoadProductOffersTransform,
+)
+
+from synix import Pipeline, SearchSurface, SynixSearch
+
+# ======================================================================
+# PIPELINE DEFINITION — edit this to change what Synix builds
+# ======================================================================
+
+pipeline = Pipeline("tv-returns-demo")
+pipeline.source_dir = "./sources"  # source data
+pipeline.build_dir = "./build"  # output artifacts
+pipeline.llm_config = {  # default LLM for all layers
+    "provider": "anthropic",
+    "model": "claude-haiku-4-5-20251001",
+    "temperature": 0.3,
+    "max_tokens": 2048,
+}
+
+# -- Layers: the DAG of transforms ------------------------------------
+# Level 0 = source (reads files), Level 1+ = derived (LLM transforms).
+# Synix hashes inputs and skips layers when nothing changed.
+
+product_offers = DemoLoadProductOffersTransform("product_offers")  # reads product_catalog + vendor_offers
+policies = DemoLoadPoliciesTransform("policies")  # reads policy markdown files
+policy_index = DemoExtractPoliciesTransform(  # LLM extracts actionable rules
+    "policy_index",
+    depends_on=[policies],  # from raw policy documents
+)
+cs_product_brief = DemoEnrichCSBriefTransform(  # LLM merges product data + policy
+    "cs_product_brief",
+    depends_on=[product_offers, policy_index],  # rules into CS reference briefs
+)
+
+cs_search = SearchSurface(
+    "cs-search",
+    sources=[cs_product_brief],
+    modes=["fulltext", "semantic"],
+    embedding_config={
+        "provider": "fastembed",
+        "model": "BAAI/bge-small-en-v1.5",
+        "dimensions": 384,
+    },
+)
+
+pipeline.add(product_offers, policies, policy_index, cs_product_brief, cs_search)
+
+# -- Projection: makes artifacts searchable ----------------------------
+pipeline.add(SynixSearch("search", surface=cs_search))

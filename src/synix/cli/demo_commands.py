@@ -1,0 +1,589 @@
+"""Demo commands — synix demo note, synix demo run."""
+
+from __future__ import annotations
+
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+import click
+from rich.panel import Panel
+
+from synix.cli.main import console
+
+
+@click.group()
+def demo():
+    """Demo tools for deterministic recordings."""
+    pass
+
+
+@demo.command()
+@click.argument("message")
+def note(message: str):
+    """Print a narrative note panel for VHS recordings.
+
+    MESSAGE is the text to display. No timestamps or dynamic content —
+    purely deterministic output for reproducible recordings.
+    """
+    console.print()
+    console.print(
+        Panel(
+            f"[bold]{message}[/bold]",
+            border_style="cyan",
+            padding=(0, 2),
+        )
+    )
+    console.print()
+
+
+@demo.command(name="run")
+@click.argument("case_dir", type=click.Path(exists=True))
+@click.option("--update-goldens", is_flag=True, help="Regenerate golden output files")
+def run_case(case_dir: str, update_goldens: bool):
+    """Run a demo case and compare against golden outputs.
+
+    CASE_DIR is the path to a demo case directory containing case.py.
+    Sets SYNIX_CASSETTE_MODE=replay and SYNIX_DEMO=1 for deterministic output.
+    """
+    case_path = Path(case_dir).resolve()
+    case_module_path = case_path / "case.py"
+
+    if not case_module_path.exists():
+        console.print(f"[red]No case.py found in {case_dir}[/red]")
+        sys.exit(1)
+
+    # Load case definition
+    case = _load_case(case_module_path)
+    if case is None:
+        console.print(f"[red]Failed to load case from {case_module_path}[/red]")
+        sys.exit(1)
+
+    pipeline_file = case.get("pipeline", "pipeline.py")
+    steps = case.get("steps", [])
+    goldens = case.get("goldens", {})
+    output_masks: dict[str, list[str]] = case.get("output_masks", {})
+    cleanup_files: list[str] = case.get("cleanup", [])
+    case_name = case.get("name", case_path.name)
+
+    console.print(
+        Panel(
+            f"[bold]Case:[/bold] {case_name}\n"
+            f"[bold]Dir:[/bold] {case_path}\n"
+            f"[bold]Steps:[/bold] {len(steps)}\n"
+            f"[bold]Goldens:[/bold] {len(goldens)}",
+            title="[bold cyan]Synix Demo Run[/bold cyan]",
+            border_style="cyan",
+        )
+    )
+
+    # Clean up artifacts from previous runs
+    _cleanup_files(case_path, cleanup_files)
+
+    # Set up environment for deterministic replay
+    env = dict(os.environ)
+    cassette_dir = str(case_path / "cassettes")
+    env["SYNIX_CASSETTE_MODE"] = "replay"
+    env["SYNIX_CASSETTE_DIR"] = cassette_dir
+    env["SYNIX_DEMO"] = "1"
+    env["COLUMNS"] = "120"
+    env["NO_COLOR"] = "1"
+
+    golden_dir = case_path / "golden"
+    golden_dir.mkdir(exist_ok=True)
+
+    captured_json: dict[str, str] = {}
+    captured_stdout: dict[str, str] = {}
+    captured_stderr: dict[str, str] = {}
+    failed = False
+
+    for step in steps:
+        step_name = step.get("name", "unnamed")
+        command = list(step.get("command", []))
+        stdin_data = step.get("stdin")
+        capture_json = step.get("capture_json", False)
+
+        # Replace PIPELINE placeholder with actual pipeline path
+        command = [pipeline_file if c == "PIPELINE" else c for c in command]
+
+        # Replace bare "synix" with the venv script path
+        # so the demo runs in the same Python environment as the runner.
+        if command and command[0] == "synix":
+            venv_synix = Path(sys.executable).parent / "synix"
+            if venv_synix.exists():
+                command[0] = str(venv_synix)
+            # If no venv script, try sys.executable -m synix.cli.main
+            else:
+                command = [sys.executable, "-m", "synix.cli.main"] + command[1:]
+
+        console.print(f"\n  [dim]step:[/dim] [bold]{step_name}[/bold]  →  {' '.join(command)}")
+
+        try:
+            result = subprocess.run(
+                command,
+                cwd=str(case_path),
+                env=env,
+                capture_output=True,
+                text=True,
+                input=stdin_data,
+                timeout=120,
+            )
+
+            if result.returncode != 0:
+                console.print(f"    [yellow]exit {result.returncode}[/yellow]")
+                if result.stderr:
+                    for line in result.stderr.strip().splitlines()[:5]:
+                        console.print(f"    [dim]{line}[/dim]")
+
+            # Show stdout (abbreviated)
+            if result.stdout:
+                lines = result.stdout.strip().splitlines()
+                for line in lines[:10]:
+                    console.print(f"    {line}")
+                if len(lines) > 10:
+                    console.print(f"    [dim]... ({len(lines) - 10} more lines)[/dim]")
+
+            # Capture stdout/stderr for every step (text golden comparison)
+            if result.stdout:
+                captured_stdout[step_name] = result.stdout
+            if result.stderr:
+                captured_stderr[step_name] = result.stderr
+
+            if capture_json and result.stdout:
+                captured_json[step_name] = result.stdout.strip()
+
+        except subprocess.TimeoutExpired:
+            console.print("    [red]TIMEOUT[/red]")
+            failed = True
+        except FileNotFoundError:
+            console.print(f"    [red]Command not found: {command[0]}[/red]")
+            failed = True
+
+    # JSON golden comparison (existing behavior)
+    if goldens:
+        console.print("\n[bold]Golden comparison (JSON):[/bold]")
+
+        for step_name, golden_file in goldens.items():
+            golden_path = golden_dir / golden_file
+
+            if step_name not in captured_json:
+                console.print(f"  {step_name}: [yellow]no captured output[/yellow]")
+                continue
+
+            actual_output = captured_json[step_name]
+
+            if update_goldens:
+                golden_path.write_text(actual_output)
+                console.print(f"  {step_name}: [cyan]updated[/cyan] → {golden_file}")
+                continue
+
+            if not golden_path.exists():
+                console.print(f"  {step_name}: [yellow]no golden file[/yellow] (run with --update-goldens)")
+                failed = True
+                continue
+
+            expected = golden_path.read_text().strip()
+            actual = actual_output.strip()
+
+            # Compare JSON structurally if both parse
+            try:
+                expected_json = json.loads(expected)
+                actual_json = json.loads(actual)
+                match = expected_json == actual_json
+            except (json.JSONDecodeError, ValueError):
+                match = expected == actual
+
+            if match:
+                console.print(f"  {step_name}: [green]PASS[/green]")
+            else:
+                console.print(f"  {step_name}: [red]FAIL[/red]")
+                failed = True
+                _show_text_diff(expected, actual, golden_file)
+
+    # Text golden comparison (stdout/stderr for every step)
+    all_step_names = [step.get("name", "unnamed") for step in steps]
+    has_text_goldens = any((golden_dir / f"{name}.stdout.txt").exists() for name in all_step_names)
+
+    if captured_stdout or has_text_goldens or update_goldens:
+        console.print("\n[bold]Golden comparison (text):[/bold]")
+
+        for step_name in all_step_names:
+            step_masks = output_masks.get(step_name, [])
+
+            # stdout golden
+            stdout_golden_file = f"{step_name}.stdout.txt"
+            stdout_golden_path = golden_dir / stdout_golden_file
+
+            if step_name in captured_stdout:
+                actual_normalized = _normalize_output(captured_stdout[step_name], case_path)
+
+                if update_goldens:
+                    stdout_golden_path.write_text(actual_normalized)
+                    console.print(f"  {step_name} stdout: [cyan]updated[/cyan] → {stdout_golden_file}")
+                elif stdout_golden_path.exists():
+                    expected = stdout_golden_path.read_text()
+                    expected_masked = _apply_masks(expected, step_masks)
+                    actual_masked = _apply_masks(actual_normalized, step_masks)
+                    if expected_masked == actual_masked:
+                        console.print(f"  {step_name} stdout: [green]PASS[/green]")
+                    else:
+                        console.print(f"  {step_name} stdout: [red]FAIL[/red]")
+                        failed = True
+                        _show_text_diff(expected_masked, actual_masked, stdout_golden_file)
+                else:
+                    console.print(f"  {step_name} stdout: [yellow]no golden[/yellow] (run with --update-goldens)")
+
+            # stderr golden (only if non-empty)
+            stderr_golden_file = f"{step_name}.stderr.txt"
+            stderr_golden_path = golden_dir / stderr_golden_file
+
+            if step_name in captured_stderr:
+                actual_normalized = _normalize_output(captured_stderr[step_name], case_path)
+
+                if update_goldens:
+                    stderr_golden_path.write_text(actual_normalized)
+                    console.print(f"  {step_name} stderr: [cyan]updated[/cyan] → {stderr_golden_file}")
+                elif stderr_golden_path.exists():
+                    expected = stderr_golden_path.read_text()
+                    expected_masked = _apply_masks(expected, step_masks)
+                    actual_masked = _apply_masks(actual_normalized, step_masks)
+                    if expected_masked == actual_masked:
+                        console.print(f"  {step_name} stderr: [green]PASS[/green]")
+                    else:
+                        console.print(f"  {step_name} stderr: [red]FAIL[/red]")
+                        failed = True
+                        _show_text_diff(expected_masked, actual_masked, stderr_golden_file)
+
+    # Clean up artifacts created during run
+    _cleanup_files(case_path, cleanup_files)
+
+    if failed:
+        console.print("\n[red]Demo case failed.[/red]")
+        sys.exit(1)
+    else:
+        console.print("\n[green]Demo case passed.[/green]")
+
+
+def _cleanup_files(case_path: Path, cleanup_files: list[str]) -> None:
+    """Remove files created during demo runs (relative to case_path)."""
+    for rel in cleanup_files:
+        path = case_path / rel
+        if path.exists():
+            path.unlink()
+
+
+def _normalize_output(text: str, case_path: Path) -> str:
+    """Replace dynamic values with stable placeholders for golden comparison."""
+    case_path_str = str(case_path)
+
+    lines = text.splitlines()
+    normalized = []
+    for line in lines:
+        # Replace case directory path with placeholder
+        line = line.replace(case_path_str, "<CASE_DIR>")
+        # Replace timing values like "1.2s" or "0.05s"
+        line = re.sub(r"\b\d+\.\d+s\b", "<TIME>", line)
+        # Drop LLM stats lines entirely (presence varies based on whether LLM calls occurred)
+        if re.search(r"LLM calls: \d+, Tokens: [\d,]+, Est\. cost: \$[\d.]+", line):
+            continue
+        # Normalize Python traceback file paths and line numbers (vary between local and CI)
+        line = re.sub(
+            r'(File ")[^"]*/(src/synix/)',
+            r"\1<PKG>/\2",
+            line,
+        )
+        # Normalize line numbers in traceback File references (shift with edits)
+        line = re.sub(r'(File "[^"]+", line )\d+', r"\1<N>", line)
+        # Normalize cassette miss keys (hash varies by environment)
+        line = re.sub(
+            r"Cassette miss for key [0-9a-f]+\.\.\.",
+            "Cassette miss for key <HASH>...",
+            line,
+        )
+        # Replace inline token/cost fragments
+        line = re.sub(r"[\d,]+ tokens, \$[\d.]+", "<N> tokens, $<COST>", line)
+        # Remove API key display line (depends on env — may or may not be present)
+        if re.search(r"│\s*API Key\s*│", line):
+            continue
+        # Normalize plan tree stats (new/cached/rebuild counts vary between fresh and incremental)
+        line = re.sub(r"((?:source|transform):\S+)\s+.*$", r"\1  <STATS>", line)
+        # Normalize build progress counts — e.g., "3 built, 7 cached" or "10 built"
+        # Replace the entire built/cached segment to avoid varying comma groups
+        line = re.sub(
+            r"\b\d+ (?:built|cached)(?:,\s*\d+ (?:built|cached))*\b",
+            "<BUILD_COUNTS>",
+            line,
+        )
+        # Normalize search projection status + index count (e.g., "cached  9 indexed" or "new  14 indexed")
+        line = re.sub(
+            r"\b(?:cached|new|rebuild|materialized|materializing\.\.\.|progressive|declared)\s+\d+ indexed\b",
+            "<MATERIALIZED>  <N> indexed",
+            line,
+        )
+        # Normalize materialization and cache status
+        line = re.sub(r"\bmaterializ(?:ed|ing\.\.\.)", "<MATERIALIZED>", line)
+        # Normalize standalone "cached", "built", "progressive", or "declared"
+        line = re.sub(r"(?<!\d )\b(?:cached|built|progressive|declared)\b", "<MATERIALIZED>", line)
+        # Normalize remaining "N indexed" counts
+        line = re.sub(r"\b\d+ indexed\b", "<N> indexed", line)
+        # Normalize the build Total line entirely
+        line = re.sub(r"^Total:.*(?:built|cached|skipped).*$", "<BUILD_TOTAL>", line)
+        # Normalize plan summary line (varies between fresh/incremental)
+        line = re.sub(r"^Estimated:.*$", "<PLAN_SUMMARY>", line)
+        # Normalize digits and placeholder padding in Build Summary table rows
+        if line.count("│") >= 5:
+            line = re.sub(r"(?<=│)\s*\d+\s*(?=│)", "  <N>  ", line)
+            # Normalize whitespace around <MATERIALIZED> in table cells
+            line = re.sub(r"│\s+<MATERIALIZED>\s+│", "│ <MATERIALIZED> │", line)
+        # Replace verify output counts (artifact/provenance/hash counts grow across runs)
+        line = re.sub(r"(\bManifest valid with )\d+( artifacts\b)", r"\g<1><N>\2", line)
+        line = re.sub(r"(\bAll )\d+( artifact (?:files|objects)\b)", r"\g<1><N>\2", line)
+        line = re.sub(r"(\bSnapshot store exists with )\d+( artifacts\b)", r"\g<1><N>\2", line)
+        line = re.sub(r"\b\d+( non-root artifacts lack provenance\b)", r"<N>\1", line)
+        line = re.sub(r"(\bAll )\d+( content hashes\b)", r"\g<1><N>\2", line)
+        line = re.sub(
+            r"(\bSynix search(?: '[^']+')? has )\d+( entries\b)",
+            r"\g<1><N>\2",
+            line,
+        )
+        # Drop embedding progress lines — presence varies with projection cache state
+        if re.search(r"└─ embeddings\s+\d+/\d+", line):
+            continue
+        # Normalize batch build IDs (random per run)
+        line = re.sub(r"\bbatch-[0-9a-f]{8}\b", "batch-<ID>", line)
+        # Normalize pipeline hashes in batch-build table cells (12-char hex between │ delimiters)
+        line = re.sub(r"(│\s*)[0-9a-f]{12}(\s*│)", r"\1<PIPELINE_HASH>\2", line)
+        # Normalize datetime stamps in batch-build table cells (between │ delimiters)
+        line = re.sub(r"(│\s*)\d{4}-\d{2}-\d{2} \d{2}:\d{2}(\s*│)", r"\1<DATETIME>\2", line)
+        # Normalize pipeline hashes in "Pipeline Hash: <hash>" lines (status output)
+        line = re.sub(r"(Pipeline Hash:\s*)[0-9a-f]{16,}", r"\1<PIPELINE_HASH>", line)
+        # Normalize full datetime in status output (YYYY-MM-DD HH:MM:SS)
+        line = re.sub(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", "<DATETIME>", line)
+        # Normalize OpenAI dashboard URLs
+        line = re.sub(
+            r"https://platform\.openai\.com/batches/\S+",
+            "https://platform.openai.com/batches/<BATCH_ID>",
+            line,
+        )
+        # Normalize release output (snapshot oid, artifact counts, release paths)
+        line = re.sub(r"Released [0-9a-f]{12} →", "Released <SNAPSHOT_OID> →", line)
+        line = re.sub(r"\(\d+ artifacts?\)", "(<N> artifacts)", line)
+        line = re.sub(r"\.synix/releases/\S+", ".synix/releases/<RELEASE_PATH>", line)
+        # Normalize tempfile names (e.g. tmplg2345ms.tmp from atomic_write errors)
+        line = re.sub(r"\btmp[a-z0-9_]+\.tmp\b", "tmp<TEMPFILE>.tmp", line)
+        # Normalize OpenAI batch IDs (batch_<hex> from real API runs)
+        line = re.sub(r"\bbatch_[A-Za-z0-9_]+\b", "batch_<OPENAI_ID>", line)
+        # Normalize Rich panel padding — collapse variable-width padding before trailing │
+        line = re.sub(r"\s+│\s*$", "  │", line)
+        # Strip trailing whitespace
+        line = line.rstrip()
+        normalized.append(line)
+    # Re-join and fix cross-line wrapping before final normalization passes
+    joined = "\n".join(normalized)
+    # Fix Rich line-wrapping that splits "(N\nartifacts)" across lines
+    joined = re.sub(r"\((\d+)\s*\n\s*artifacts?\)", r"(<N> artifacts)", joined)
+    # Fix Rich line-wrapping that splits release "→  path" across lines
+    # e.g., "● context-doc  flat_file  →\n<CASE_DIR>/..." → single line
+    joined = re.sub(r"→\s*\n\s*", "→  ", joined)
+    # Join release path with artifact count that wrapped to next line
+    joined = re.sub(r"(<RELEASE_PATH>)\s*\n\s*(\(<N> artifacts\))", r"\1  \2", joined)
+    normalized = joined.splitlines()
+    # Sort consecutive groups of spinner (⟳) lines to absorb concurrency non-determinism
+    normalized = _sort_consecutive_spinner_lines(normalized)
+    # Sort consecutive same-level build progress lines to absorb DAG ordering non-determinism
+    normalized = _sort_consecutive_level_lines(normalized)
+    # Sort consecutive table rows sharing the same level column (Build Summary table)
+    normalized = _sort_consecutive_table_rows(normalized)
+    # Collapse Python tracebacks to just File lines + exception (body varies by Python version)
+    normalized = _collapse_tracebacks(normalized)
+    return "\n".join(normalized)
+
+
+def _sort_consecutive_spinner_lines(lines: list[str]) -> list[str]:
+    """Sort consecutive groups of spinner (⟳) lines for deterministic output.
+
+    Concurrent build steps may complete in arbitrary order, producing
+    non-deterministic orderings of progress lines like:
+        ⟳ competitive intel t-text-acme...
+        ⟳ competitive intel t-text-dataflo...
+    Sorting these groups removes concurrency-induced non-determinism.
+    """
+    result: list[str] = []
+    group: list[str] = []
+
+    def flush():
+        if group:
+            result.extend(sorted(group))
+            group.clear()
+
+    for line in lines:
+        if "\u21bb" in line:  # ⟳
+            group.append(line)
+        else:
+            flush()
+            result.append(line)
+    flush()
+    return result
+
+
+def _sort_consecutive_level_lines(lines: list[str]) -> list[str]:
+    """Sort consecutive build progress lines that share the same DAG level.
+
+    Concurrent execution of same-level layers produces non-deterministic
+    orderings like:
+        ✓ policies (level 0)  <BUILD_COUNTS>  <TIME>
+        ✓ product_offers (level 0)  <BUILD_COUNTS>  <TIME>
+    Sorting these groups removes DAG-ordering non-determinism.
+    """
+    _level_re = re.compile(r"\(level (\d+)\)")
+    result: list[str] = []
+    group: list[str] = []
+    group_level: str | None = None
+
+    def flush():
+        if group:
+            result.extend(sorted(group))
+            group.clear()
+
+    for line in lines:
+        m = _level_re.search(line)
+        if m:
+            level = m.group(1)
+            if group_level == level:
+                group.append(line)
+            else:
+                flush()
+                group_level = level
+                group.append(line)
+        else:
+            flush()
+            group_level = None
+            result.append(line)
+    flush()
+    return result
+
+
+def _sort_consecutive_table_rows(lines: list[str]) -> list[str]:
+    """Sort consecutive Build Summary table rows that share the same level cell.
+
+    Rich table rows like ``│ policies │  <N>  │ ...`` at the same level may
+    appear in non-deterministic order. Group consecutive data rows by their
+    second cell value (the Level column after normalization) and sort within
+    each group.
+    """
+    _table_data_re = re.compile(r"^│\s+\S+\s+│")
+    result: list[str] = []
+    group: list[str] = []
+    group_level: str | None = None
+
+    def _extract_level(line: str) -> str | None:
+        """Extract the second │-delimited cell (the Level column)."""
+        cells = line.split("│")
+        if len(cells) >= 3:
+            return cells[2].strip()
+        return None
+
+    def flush():
+        if group:
+            result.extend(sorted(group))
+            group.clear()
+
+    for line in lines:
+        if _table_data_re.match(line):
+            level = _extract_level(line)
+            if group_level == level:
+                group.append(line)
+            else:
+                flush()
+                group_level = level
+                group.append(line)
+        else:
+            flush()
+            group_level = None
+            result.append(line)
+    flush()
+    return result
+
+
+def _collapse_tracebacks(lines: list[str]) -> list[str]:
+    """Collapse Python traceback bodies to just File lines + exception.
+
+    Python 3.12+ shows fine-grained error locations with ^^^^^^^^ carets,
+    while older versions show the source code lines. Strip the indented
+    body lines between ``File "..."`` lines so tracebacks compare equal
+    across Python versions.
+    """
+    result: list[str] = []
+    in_traceback = False
+    for line in lines:
+        if line == "Traceback (most recent call last):":
+            in_traceback = True
+            result.append(line)
+        elif in_traceback:
+            # File lines are indented with 2 spaces
+            if re.match(r"  File ", line):
+                result.append(line)
+            elif line.startswith("    "):
+                # Source code or caret line — skip
+                continue
+            else:
+                # Exception line (not indented with 4 spaces) — ends the traceback
+                in_traceback = False
+                result.append(line)
+        else:
+            result.append(line)
+    return result
+
+
+def _apply_masks(text: str, masks: list[str]) -> str:
+    """Remove lines matching any mask pattern from text."""
+    if not masks:
+        return text
+    compiled = [re.compile(p) for p in masks]
+    lines = text.splitlines()
+    filtered = [line for line in lines if not any(p.search(line) for p in compiled)]
+    return "\n".join(filtered)
+
+
+def _show_text_diff(expected: str, actual: str, label: str) -> None:
+    """Show a unified diff between expected and actual text, capped at 15 lines."""
+    diff_lines = list(
+        difflib.unified_diff(
+            expected.splitlines(),
+            actual.splitlines(),
+            fromfile=f"golden/{label}",
+            tofile="actual",
+            lineterm="",
+        )
+    )
+    if not diff_lines:
+        return
+    for line in diff_lines[:15]:
+        if line.startswith("+") and not line.startswith("+++"):
+            console.print(f"    [green]{line}[/green]")
+        elif line.startswith("-") and not line.startswith("---"):
+            console.print(f"    [red]{line}[/red]")
+        else:
+            console.print(f"    [dim]{line}[/dim]")
+    if len(diff_lines) > 15:
+        console.print(f"    [dim]... ({len(diff_lines) - 15} more diff lines)[/dim]")
+
+
+def _load_case(case_path: Path) -> dict | None:
+    """Load a case.py module and return its `case` dict."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("case", str(case_path))
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as e:
+        console.print(f"[red]Error loading case.py:[/red] {e}")
+        return None
+    return getattr(module, "case", None)

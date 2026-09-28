@@ -1,0 +1,10 @@
+# Core deps (pip install -e .)
+click
+pydantic
+rich
+anthropic>=0.40,<1.0
+openai
+python-dotenv
+pyyaml
+fastembed
+httpx
